@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv_py39_backup/
+
+# Local tooling cache
+.pycache_local/
+
+# Project runtime data
+cache/*.json
+chroma_db/
+
+# OS / editors
+.DS_Store

@@ -1,7 +1,7 @@
-<h1 align="center">RAG Assistant · Мастер на час</h1>
+<h1 align="center">RAG Assistant</h1>
 
 <p align="center">
-  Локальный RAG-ассистент на Python для клиентских вопросов по услуге «Мастер на час» в Санкт-Петербурге
+  Локальный RAG-ассистент на Python для вопросов по базе знаний
 </p>
 
 <p align="center">
@@ -14,7 +14,6 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Topic-Мастер%20на%20час-E11D48?style=flat-square" alt="Topic">
   <img src="https://img.shields.io/badge/Language-Русский-2563EB?style=flat-square" alt="Language">
   <img src="https://img.shields.io/badge/Retrieval-Debug%20Mode-14B8A6?style=flat-square" alt="Retrieval Debug">
   <img src="https://img.shields.io/badge/Cache-File%20Cache-F59E0B?style=flat-square" alt="Cache">
@@ -155,7 +154,7 @@ python rag_evaluation.py
 - задает все тестовые вопросы через `RAGPipeline`
 - собирает ответы и найденные контексты
 - сравнивает их с эталонными ответами
-- считает метрики `faithfulness`, `answer_relevancy`, `context_precision`, `context_recall`, `answer_correctness`, `semantic_similarity`
+- считает метрики `faithfulness`, `answer_relevancy`, `answer_correctness`, `semantic_similarity`
 - печатает значения по каждому вопросу и средние значения
 
 ## CLI для оценки RAG
@@ -168,7 +167,7 @@ python rag_evaluation.py
 - `--show-context` - показывать найденные чанки и источники по каждому тесту
 - `--verbose` - показывать расширенный вывод: вопрос, ответ, эталон, источники, чанки, метрики и комментарий
 - `--only-failed` - показывать только слабые тесты, где основная доступная метрика ниже `0.7`
-- `--fast` - запустить упрощенный режим только с метриками `faithfulness` и `answer_relevancy`
+- `--fast` - запустить безопасный укороченный режим с метриками `faithfulness` и `answer_relevancy`
 - `--save-report reports/last_eval.txt` - сохранить весь человекочитаемый отчет в текстовый файл
 
 Как читать вывод:
@@ -183,7 +182,7 @@ python rag_evaluation.py
 - `Faithfulness` - насколько ответ опирается на найденный контекст
 - `Answer relevance` - насколько ответ вообще относится к вопросу
 
-Сейчас в безопасном режиме оценки используются только эти две метрики, потому что embedding-метрики могут падать из-за несовместимости клиента embeddings и async-режима в RAGAS.
+В обычном режиме CLI использует `AsyncOpenAI` и совместимый embeddings adapter, поэтому доступны и embedding-based метрики. Режим `--fast` оставляет только более короткий набор метрик для быстрого прогона.
 
 Как интерпретировать итог:
 

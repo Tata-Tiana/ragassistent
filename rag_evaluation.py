@@ -3,17 +3,60 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Any
 
 from datasets import Dataset
+from dotenv import load_dotenv
+from openai import AsyncOpenAI, OpenAI
 from ragas import evaluate
-from ragas.metrics._answer_relevance import answer_relevancy
-from ragas.metrics._faithfulness import faithfulness
+from ragas.embeddings.base import BaseRagasEmbeddings
+from ragas.llms import llm_factory
+from ragas.metrics import AnswerCorrectness, AnswerRelevancy, Faithfulness, SemanticSimilarity
 
 from config import CHUNK_MIN_SIZE, CHUNK_OVERLAP, CHUNK_SIZE, TOP_K
 from rag_pipeline import RAGPipeline
 from test_questions import TEST_DATASET
+
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+EVALUATION_MODEL = "gpt-4o-mini"
+
+
+class OpenAIEmbeddingAdapter(BaseRagasEmbeddings):
+    """Адаптер OpenAI embeddings для legacy- и async-режимов RAGAS."""
+
+    def __init__(self, sync_client: OpenAI, async_client: AsyncOpenAI, model: str) -> None:
+        super().__init__()
+        self.sync_client = sync_client
+        self.async_client = async_client
+        self.model = model
+        self.provider_name = "OpenAIEmbeddingAdapter"
+
+    def embed_query(self, text: str) -> list[float]:
+        """Синхронный embedding одного текста для legacy-метрик."""
+        response = self.sync_client.embeddings.create(model=self.model, input=text)
+        return response.data[0].embedding
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Синхронный embedding списка текстов для legacy-метрик."""
+        response = self.sync_client.embeddings.create(model=self.model, input=texts)
+        return [item.embedding for item in response.data]
+
+    async def aembed_query(self, text: str) -> list[float]:
+        """Асинхронный embedding одного текста для async-метрик."""
+        response = await self.async_client.embeddings.create(model=self.model, input=text)
+        return response.data[0].embedding
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Асинхронный embedding списка текстов для async-метрик."""
+        response = await self.async_client.embeddings.create(model=self.model, input=texts)
+        return [item.embedding for item in response.data]
+
+    def describe(self) -> str:
+        """Короткое текстовое описание адаптера для CLI."""
+        return f"{self.provider_name}(model={self.model}, client=AsyncOpenAI)"
 
 
 class Reporter:
@@ -41,32 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Человекочитаемая оценка качества RAG-ассистента 'Мастер на час'.",
     )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Ограничить количество тестов. Пример: --limit 5",
-    )
-    parser.add_argument(
-        "--show-context",
-        action="store_true",
-        help="Показывать найденные чанки и источники по каждому тесту.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Показывать расширенный вывод по каждому тесту.",
-    )
-    parser.add_argument(
-        "--only-failed",
-        action="store_true",
-        help="Показывать только слабые тесты, где основная доступная метрика < 0.7.",
-    )
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help="Запустить упрощенный режим только с метриками faithfulness и answer_relevancy.",
-    )
+    parser.add_argument("--limit", type=int, default=None, help="Ограничить количество тестов. Пример: --limit 5")
+    parser.add_argument("--show-context", action="store_true", help="Показывать найденные чанки и источники по каждому тесту.")
+    parser.add_argument("--verbose", action="store_true", help="Показывать расширенный вывод по каждому тесту.")
+    parser.add_argument("--only-failed", action="store_true", help="Показывать только слабые тесты, где основная доступная метрика < 0.7.")
+    parser.add_argument("--fast", action="store_true", help="Запустить безопасный укороченный режим с меньшим набором метрик.")
     parser.add_argument(
         "--save-report",
         type=str,
@@ -98,7 +120,7 @@ def print_header(reporter: Reporter) -> None:
     reporter.write("python rag_evaluation.py --show-context — показать найденные чанки и источники")
     reporter.write("python rag_evaluation.py --limit 5 --verbose --show-context — короткий, но подробный прогон с контекстом")
     reporter.write("python rag_evaluation.py --only-failed — показать только слабые тесты")
-    reporter.write("python rag_evaluation.py --fast — упрощённый безопасный режим оценки")
+    reporter.write("python rag_evaluation.py --fast — безопасный режим с меньшим набором метрик")
     reporter.write("python clear_cache.py — очистить файловый кэш")
     reporter.write("python clear_cache.py --all — очистить кэш и локальную базу ChromaDB")
     reporter.write("")
@@ -141,8 +163,8 @@ def metric_value(row: dict[str, Any], name: str) -> float | None:
 
 
 def choose_quality_metric(row: dict[str, Any]) -> tuple[str, float | None]:
-    """Выбирает доступную метрику для интерпретации качества."""
-    for metric_name in ["answer_relevancy", "faithfulness"]:
+    """Выбирает основную метрику для интерпретации качества."""
+    for metric_name in ["answer_correctness", "semantic_similarity", "answer_relevancy", "faithfulness"]:
         value = metric_value(row, metric_name)
         if value is not None:
             return metric_name, value
@@ -150,46 +172,51 @@ def choose_quality_metric(row: dict[str, Any]) -> tuple[str, float | None]:
 
 
 def build_comment_from_metrics(row: dict[str, Any]) -> str:
-    """Строит короткий комментарий по доступным метрикам."""
-    metric_name, quality_value = choose_quality_metric(row)
+    """Строит короткий комментарий по качеству ответа."""
+    _, quality_value = choose_quality_metric(row)
+    answer_relevancy_value = metric_value(row, "answer_relevancy")
     faithfulness_value = metric_value(row, "faithfulness")
 
     if quality_value is None:
-        return "Не все метрики доступны, поэтому итог лучше оценивать вручную по ответу и контексту."
-
-    if quality_value >= 0.85:
-        comment = "Ответ хороший: система нашла нужный контекст и ответ выглядит уверенно."
+        comment = "Метрики доступны не полностью, поэтому итог лучше оценивать вручную по ответу и контексту."
+    elif quality_value >= 0.85:
+        comment = "Ответ хороший: система нашла нужный контекст и ответ близок к эталону."
     elif quality_value >= 0.65:
-        comment = "Ответ частично корректный: смысл в целом близкий, но возможны неточности или неполнота."
+        comment = "Ответ частично корректный: смысл в целом близкий, но есть неточности или неполнота."
     else:
-        comment = "Ответ слабый: система либо нашла не тот контекст, либо ответила слишком слабо."
+        comment = "Ответ слабый: система либо нашла не тот контекст, либо ответила неполно или неверно."
 
-    if metric_name == "answer_relevancy" and quality_value < 0.65:
-        comment += " Похоже, ответ недостаточно хорошо попадает в сам вопрос."
-    if faithfulness_value is not None and faithfulness_value < 0.65:
-        comment += " Также есть риск, что ответ слабо опирается на найденный контекст."
+    hints: list[str] = []
+    if answer_relevancy_value is not None and answer_relevancy_value < 0.6:
+        hints.append("Ответ не очень точно попадает в формулировку вопроса.")
+    if faithfulness_value is not None and faithfulness_value < 0.6:
+        hints.append("Есть риск, что ответ слабо опирается на найденный контекст.")
 
+    if hints:
+        comment = f"{comment} {' '.join(hints)}"
     return comment
 
 
-def build_summary_comment(avg_quality: float | None) -> str:
+def build_summary_comment(avg_correctness: float | None) -> str:
     """Возвращает общую интерпретацию итогового качества системы."""
-    if avg_quality is None:
-        return "Не все метрики доступны, поэтому итог лучше оценивать вместе с примерами ответов."
-    if avg_quality >= 0.85:
+    if avg_correctness is None:
+        return "Не все ключевые метрики доступны, поэтому итог лучше оценивать вместе с примерами ответов."
+    if avg_correctness >= 0.85:
         return "Система работает хорошо. Можно переходить к точечной доработке качества."
-    if avg_quality >= 0.65:
-        return "Система уже рабочая, но есть заметные слабые места. Стоит улучшить retrieval или формулировку prompt."
-    return "Система работает нестабильно. Нужно проверить базу знаний, retrieval и качество ответов."
+    if avg_correctness >= 0.65:
+        return "Система уже рабочая, но есть заметные слабые места. Стоит улучшить retrieval, prompt или базу знаний."
+    return "Система работает нестабильно. Нужно проверить retrieval, prompt, embeddings и тестовый набор."
 
 
 def build_summary_tips(averages: dict[str, float | None]) -> list[str]:
     """Формирует короткие советы на основе средних метрик."""
     tips: list[str] = []
     if averages.get("faithfulness") is not None and averages["faithfulness"] < 0.7:
-        tips.append("Совет: ответы не всегда уверенно опираются на найденный контекст. Проверь prompt и качество retrieved chunks.")
+        tips.append("Совет: ответы не всегда уверенно опираются на найденный контекст. Проверь prompt и качество retrieval.")
     if averages.get("answer_relevancy") is not None and averages["answer_relevancy"] < 0.7:
         tips.append("Совет: ответы не всегда достаточно точно попадают в вопрос. Проверь retrieval и формулировку запроса к модели.")
+    if averages.get("answer_correctness") is not None and averages["answer_correctness"] < 0.7:
+        tips.append("Совет: ответ заметно отличается от эталона. Проверь prompt и качество найденных источников.")
     return tips
 
 
@@ -219,6 +246,8 @@ def print_test_result(
     reporter.write("📊 Метрики:")
     reporter.write(f"- Faithfulness: {format_metric(row.get('faithfulness'))}")
     reporter.write(f"- Answer relevance: {format_metric(row.get('answer_relevancy'))}")
+    reporter.write(f"- Answer correctness: {format_metric(row.get('answer_correctness'))}")
+    reporter.write(f"- Semantic similarity: {format_metric(row.get('semantic_similarity'))}")
     reporter.write("")
     reporter.write("💡 Комментарий:")
     reporter.write(build_comment_from_metrics(row))
@@ -298,12 +327,7 @@ def merge_records_with_scores(records: list[dict[str, Any]], scores: object) -> 
     merged: list[dict[str, Any]] = []
 
     for index, item in enumerate(records):
-        merged.append(
-            {
-                **item,
-                "metrics": frame.iloc[index].to_dict(),
-            }
-        )
+        merged.append({**item, "metrics": frame.iloc[index].to_dict()})
     return merged
 
 
@@ -311,7 +335,6 @@ def should_show_test(item: dict[str, Any], only_failed: bool) -> bool:
     """Решает, нужно ли печатать тест с учетом фильтра only-failed."""
     if not only_failed:
         return True
-
     _, metric = choose_quality_metric(item["metrics"])
     if metric is None:
         return True
@@ -321,15 +344,9 @@ def should_show_test(item: dict[str, Any], only_failed: bool) -> bool:
 def calculate_averages(results: list[dict[str, Any]]) -> dict[str, float | None]:
     """Считает средние значения по всем доступным метрикам."""
     averages: dict[str, float | None] = {}
-
-    for metric_name in ["faithfulness", "answer_relevancy"]:
-        values = [
-            metric_value(item["metrics"], metric_name)
-            for item in results
-            if metric_value(item["metrics"], metric_name) is not None
-        ]
+    for metric_name in ["faithfulness", "answer_relevancy", "answer_correctness", "semantic_similarity"]:
+        values = [metric_value(item["metrics"], metric_name) for item in results if metric_value(item["metrics"], metric_name) is not None]
         averages[metric_name] = sum(values) / len(values) if values else None
-
     return averages
 
 
@@ -337,11 +354,13 @@ def print_summary(reporter: Reporter, results: list[dict[str, Any]]) -> None:
     """Печатает итоговый summary по всем тестам."""
     averages = calculate_averages(results)
     problematic_tests = [
-        item
-        for item in results
-        if (choose_quality_metric(item["metrics"])[1] is not None and choose_quality_metric(item["metrics"])[1] < 0.7)
+        item for item in results if (choose_quality_metric(item["metrics"])[1] is not None and choose_quality_metric(item["metrics"])[1] < 0.7)
     ]
-    avg_quality = averages.get("answer_relevancy")
+    avg_quality = averages.get("answer_correctness")
+    if avg_quality is None:
+        avg_quality = averages.get("semantic_similarity")
+    if avg_quality is None:
+        avg_quality = averages.get("answer_relevancy")
     if avg_quality is None:
         avg_quality = averages.get("faithfulness")
 
@@ -356,6 +375,8 @@ def print_summary(reporter: Reporter, results: list[dict[str, Any]]) -> None:
     reporter.write("Средние метрики:")
     reporter.write(f"- Faithfulness avg: {format_metric(averages.get('faithfulness'))}")
     reporter.write(f"- Answer relevance avg: {format_metric(averages.get('answer_relevancy'))}")
+    reporter.write(f"- Answer correctness avg: {format_metric(averages.get('answer_correctness'))}")
+    reporter.write(f"- Semantic similarity avg: {format_metric(averages.get('semantic_similarity'))}")
     reporter.write("")
     reporter.write("💡 Общая оценка:")
     reporter.write(build_summary_comment(avg_quality))
@@ -372,15 +393,39 @@ def print_summary(reporter: Reporter, results: list[dict[str, Any]]) -> None:
     reporter.write("- python rag_evaluation.py --limit 5 — быстрый прогон на 5 тестах")
     reporter.write("- python rag_evaluation.py --verbose --show-context — подробный режим с retrieval")
     reporter.write("- python rag_evaluation.py --only-failed — показать только слабые тесты")
-    reporter.write("- python rag_evaluation.py --fast — безопасный режим без сложных метрик")
+    reporter.write("- python rag_evaluation.py --fast — безопасный режим с меньшим набором метрик")
     reporter.write("- python clear_cache.py — очистить файловый кэш")
     reporter.write("- python clear_cache.py --all — очистить кэш и индекс")
     reporter.write("")
 
 
-def get_enabled_metrics(args: argparse.Namespace) -> list[Any]:
-    """Возвращает стабильный набор метрик без embedding-зависимостей."""
-    return [faithfulness, answer_relevancy]
+def build_runtime_components() -> tuple[Any, OpenAIEmbeddingAdapter]:
+    """Создает совместимые с RAGAS LLM и embeddings-компоненты."""
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Не найден OPENAI_API_KEY. Создайте .env по примеру из .env.example.")
+
+    sync_client = OpenAI(api_key=api_key)
+    async_client = AsyncOpenAI(api_key=api_key)
+    llm = llm_factory(EVALUATION_MODEL, client=async_client)
+    embeddings = OpenAIEmbeddingAdapter(sync_client=sync_client, async_client=async_client, model=EMBEDDING_MODEL)
+    return llm, embeddings
+
+
+def get_enabled_metrics(args: argparse.Namespace, llm: Any, embeddings: OpenAIEmbeddingAdapter) -> list[Any]:
+    """Возвращает набор метрик для выбранного режима запуска."""
+    metrics: list[Any] = [
+        Faithfulness(llm=llm),
+        AnswerRelevancy(llm=llm, embeddings=embeddings),
+    ]
+
+    if args.fast:
+        return metrics
+
+    metrics.append(AnswerCorrectness(llm=llm, embeddings=embeddings))
+    metrics.append(SemanticSimilarity(embeddings=embeddings))
+    return metrics
 
 
 def evaluate_rag(args: argparse.Namespace) -> None:
@@ -415,18 +460,26 @@ def evaluate_rag(args: argparse.Namespace) -> None:
     reporter.write(f"- TOP_K = {TOP_K}")
     reporter.write("")
 
+    llm, embeddings = build_runtime_components()
+    metrics = get_enabled_metrics(args, llm, embeddings)
+
     if args.fast:
-        reporter.write("⚠️ Запущен упрощённый режим (без embedding-метрик)")
+        reporter.write("⚠️ Запущен упрощённый режим (меньше метрик, быстрее запуск)")
         reporter.write("")
+
+    reporter.write(f"🔌 Embeddings provider: {embeddings.describe()}")
+    reporter.write(f"🧪 Метрики запуска: {', '.join(metric.name for metric in metrics)}")
+    reporter.write("")
 
     records = collect_test_records(pipeline, args.limit, reporter)
     dataset = build_ragas_dataset(records)
 
     reporter.write("🧠 Шаг 4. Считаю метрики RAGAS...")
-    reporter.write("Используемые метрики: faithfulness, answer_relevancy")
     scores = evaluate(
         dataset=dataset,
-        metrics=get_enabled_metrics(args),
+        metrics=metrics,
+        llm=llm,
+        embeddings=embeddings,
     )
     reporter.write("✅ Метрики рассчитаны")
     reporter.write("")

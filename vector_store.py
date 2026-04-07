@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,7 +16,21 @@ from cache_utils import (
     save_metadata,
     save_query_cache,
 )
-from config import CHUNK_MIN_SIZE, CHUNK_OVERLAP, CHUNK_SIZE, TOP_K
+from config import (
+    CHUNK_MIN_SIZE,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    ENABLE_RERANKER,
+    FAQ_EMBEDDING_WEIGHT,
+    FAQ_KEYWORD_WEIGHT,
+    PRICE_RETRIEVAL_K,
+    PRICE_EMBEDDING_WEIGHT,
+    PRICE_KEYWORD_WEIGHT,
+    SERVICE_RETRIEVAL_K,
+    SERVICE_EMBEDDING_WEIGHT,
+    SERVICE_KEYWORD_WEIGHT,
+    TOP_K,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,6 +38,71 @@ DATA_DIR = BASE_DIR / "data"
 CHROMA_PATH = BASE_DIR / "chroma_db"
 COLLECTION_NAME = "local_rag_knowledge_base"
 EMBEDDING_MODEL = "text-embedding-3-small"
+INDEX_VERSION = 2
+
+PRICE_QUERY_MARKERS = [
+    "сколько стоит",
+    "цен",
+    "стоимост",
+    "по цене",
+    "от ",
+]
+
+SERVICE_QUERY_MARKERS = [
+    "что входит",
+    "что не входит",
+    "какие работ",
+    "подходит",
+    "не подходит",
+    "формат мастер на час",
+    "капитальн",
+]
+
+FAQ_QUERY_MARKERS = [
+    "гарант",
+    "оплат",
+    "материал",
+    "район",
+    "районы",
+    "москва",
+    "инструмент",
+    "выезд",
+]
+
+LIST_MARKERS = ["- ", "•", ":"]
+
+STOPWORDS = {
+    "и",
+    "в",
+    "во",
+    "на",
+    "с",
+    "со",
+    "по",
+    "для",
+    "от",
+    "до",
+    "или",
+    "ли",
+    "а",
+    "но",
+    "что",
+    "это",
+    "как",
+    "у",
+    "к",
+    "из",
+    "за",
+    "не",
+    "нет",
+    "при",
+    "если",
+    "так",
+    "же",
+    "уже",
+    "мне",
+    "вам",
+}
 
 
 class VectorStore:
@@ -44,6 +124,82 @@ class VectorStore:
             documents.append({"source": path.name, "text": text})
 
         return documents
+
+    def get_doc_type(self, source: str) -> str:
+        """Определяет тип документа по имени файла."""
+        if source.startswith("price_"):
+            return "price"
+        if source.startswith("faq_"):
+            return "faq"
+        if source.startswith("services_"):
+            return "service"
+        if source.startswith("company_info_"):
+            return "company_info"
+        return "general"
+
+    def normalize_query(self, text: str) -> str:
+        """Нормализует пользовательский запрос для keyword search."""
+        text = text.lower().replace("ё", "е")
+        text = re.sub(r"[\.,:;!\?\(\)\[\]\"'«»/\\\-]+", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def tokenize_query(self, text: str) -> list[str]:
+        """Разбивает запрос на полезные слова без коротких стоп-слов."""
+        normalized = self.normalize_query(text)
+        tokens = re.findall(r"[a-zа-я0-9]+", normalized)
+        return [token for token in tokens if len(token) > 2 and token not in STOPWORDS]
+
+    def tokenize_text(self, text: str) -> list[str]:
+        """Общая токенизация текста для lexical search."""
+        return self.tokenize_query(text)
+
+    def tokens_soft_match(self, left_token: str, right_token: str) -> bool:
+        """Мягко сравнивает токены, чтобы переживать обычные словоформы."""
+        if left_token == right_token:
+            return True
+        if left_token in right_token or right_token in left_token:
+            return True
+        if len(left_token) >= 5 and len(right_token) >= 5:
+            return left_token[:5] == right_token[:5]
+        return False
+
+    def detect_query_type(self, query: str) -> str:
+        """Просто определяет тип запроса для retrieval."""
+        normalized_query = self.normalize_query(query)
+
+        if any(marker in normalized_query for marker in PRICE_QUERY_MARKERS):
+            return "price"
+        if any(marker in normalized_query for marker in SERVICE_QUERY_MARKERS):
+            return "service"
+        if any(marker in normalized_query for marker in FAQ_QUERY_MARKERS):
+            return "faq"
+        return "general"
+
+    def lexical_overlap_score(self, query: str, text: str, query_type: str) -> float:
+        """Считает простой lexical score для keyword retrieval."""
+        query_tokens = self.tokenize_text(query)
+        text_tokens = self.tokenize_text(text)
+        if not query_tokens or not text_tokens:
+            return 0.0
+
+        score = 0.0
+        for token in query_tokens:
+            if any(self.tokens_soft_match(token, text_token) for text_token in text_tokens):
+                # Более длинные и редкие по виду слова дают чуть больший вклад.
+                score += 1.0 + min(len(token) / 10, 0.5)
+
+        normalized_query = self.normalize_query(query)
+        normalized_text = self.normalize_query(text)
+
+        if normalized_query and normalized_query in normalized_text:
+            score += 3.0
+
+        # Для service-вопросов списки полезнее общих абзацев.
+        if query_type == "service" and any(marker in text for marker in LIST_MARKERS):
+            score += 1.2
+
+        return round(score, 4)
 
     def calculate_documents_hash(self, documents: list[dict[str, str]]) -> str:
         """Считает общий хэш по именам и содержимому всех txt-файлов."""
@@ -241,7 +397,11 @@ class VectorStore:
         metadata = load_metadata()
         collection_count = self.collection.count()
 
-        if metadata.get("file_hash") == file_hash and collection_count > 0:
+        if (
+            metadata.get("file_hash") == file_hash
+            and metadata.get("index_version") == INDEX_VERSION
+            and collection_count > 0
+        ):
             return {
                 "status": "cached",
                 "chunks_count": collection_count,
@@ -258,6 +418,7 @@ class VectorStore:
                 all_metadatas.append(
                     {
                         "source": document["source"],
+                        "doc_type": self.get_doc_type(document["source"]),
                         "chunk_index": chunk_index,
                     }
                 )
@@ -273,7 +434,7 @@ class VectorStore:
             metadatas=all_metadatas,
         )
 
-        save_metadata(file_hash=file_hash, chunks_count=len(all_chunks))
+        save_metadata(file_hash=file_hash, chunks_count=len(all_chunks), index_version=INDEX_VERSION)
         save_query_cache({})
 
         return {
@@ -300,6 +461,333 @@ class VectorStore:
         save_query_cache(query_cache)
         return embedding
 
+    def build_context(
+        self,
+        document: str,
+        metadata: dict[str, Any],
+        rank: int,
+        embedding_distance: float | None = None,
+        keyword_score: int = 0,
+    ) -> dict[str, Any]:
+        """Собирает единый формат context-объекта."""
+        embedding_score = 0.0
+        if embedding_distance is not None:
+            embedding_score = 1 / (1 + max(embedding_distance, 0))
+
+        return {
+            "rank": rank,
+            "text": document,
+            "source": metadata.get("source", "unknown"),
+            "doc_type": metadata.get("doc_type", "general"),
+            "chunk_index": metadata.get("chunk_index", -1),
+            "embedding_distance": embedding_distance,
+            "embedding_score": round(embedding_score, 4),
+            "keyword_score": keyword_score,
+        }
+
+    def run_chroma_query(
+        self,
+        query_embedding: list[float],
+        n_results: int,
+        doc_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Выполняет один Chroma query и форматирует результат."""
+        query_kwargs: dict[str, Any] = {
+            "query_embeddings": [query_embedding],
+            "n_results": n_results,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if doc_type:
+            query_kwargs["where"] = {"doc_type": doc_type}
+
+        results = self.collection.query(**query_kwargs)
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        contexts: list[dict[str, Any]] = []
+        for rank, (document, metadata, distance) in enumerate(zip(documents, metadatas, distances), start=1):
+            contexts.append(
+                self.build_context(
+                    document=document,
+                    metadata=metadata,
+                    rank=rank,
+                    embedding_distance=distance,
+                )
+            )
+        return contexts
+
+    def embedding_search(
+        self,
+        question: str,
+        n_results: int,
+        doc_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ищет по embeddings, при необходимости только в нужных типах документов."""
+        question_embedding = self.get_question_embedding(question)
+
+        if not doc_types:
+            return self.run_chroma_query(question_embedding, n_results=n_results)
+
+        merged: dict[tuple[str, int], dict[str, Any]] = {}
+        for doc_type in doc_types:
+            for item in self.run_chroma_query(question_embedding, n_results=n_results, doc_type=doc_type):
+                key = (item["source"], item["chunk_index"])
+                existing = merged.get(key)
+                if not existing or item["embedding_score"] > existing["embedding_score"]:
+                    merged[key] = item
+
+        results = sorted(
+            merged.values(),
+            key=lambda item: (-item["embedding_score"], item["source"], item["chunk_index"]),
+        )
+        for rank, item in enumerate(results, start=1):
+            item["rank"] = rank
+        return results
+
+    def search_price_by_keywords(self, query: str, k: int = PRICE_RETRIEVAL_K) -> list[dict[str, Any]]:
+        """Ищет price-чанки по простому совпадению слов из запроса."""
+        return self.search_by_keywords(query=query, top_k=k, doc_types=["price"], query_type="price")
+
+    def search_by_keywords(
+        self,
+        query: str,
+        chunks: list[dict[str, Any]] | None = None,
+        top_k: int = 10,
+        doc_types: list[str] | None = None,
+        query_type: str = "general",
+    ) -> list[dict[str, Any]]:
+        """Делает простой lexical search по токенам и точным фразам."""
+        if chunks is None:
+            get_kwargs: dict[str, Any] = {"include": ["documents", "metadatas"]}
+            if doc_types and len(doc_types) == 1:
+                get_kwargs["where"] = {"doc_type": doc_types[0]}
+            raw_results = self.collection.get(**get_kwargs)
+            documents = raw_results.get("documents", [])
+            metadatas = raw_results.get("metadatas", [])
+            chunks = [
+                self.build_context(document=document, metadata=metadata, rank=0)
+                for document, metadata in zip(documents, metadatas)
+                if not doc_types or metadata.get("doc_type", "general") in doc_types
+            ]
+
+        keyword_rows: list[dict[str, Any]] = []
+        for chunk in chunks:
+            keyword_score = self.lexical_overlap_score(query, chunk["text"], query_type=query_type)
+            if keyword_score <= 0:
+                continue
+
+            item = {**chunk}
+            item["keyword_score"] = keyword_score
+            keyword_rows.append(item)
+
+        keyword_rows.sort(
+            key=lambda item: (-item["keyword_score"], item["source"], item["chunk_index"]),
+        )
+        for rank, item in enumerate(keyword_rows, start=1):
+            item["rank"] = rank
+        return keyword_rows[:top_k]
+
+    def extract_best_price_line(self, query: str, text: str) -> str:
+        """Оставляет одну самую релевантную строку с ценой вместо списка соседних цен."""
+        query_tokens = set(self.tokenize_query(query))
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        price_lines = [line for line in lines if not line.startswith("#")]
+        if not price_lines:
+            price_lines = lines
+
+        best_line = price_lines[0] if price_lines else text.strip()
+        best_score = -1
+
+        for line in price_lines:
+            line_tokens = set(self.tokenize_query(line))
+            score = len(query_tokens & line_tokens)
+            if score > best_score:
+                best_score = score
+                best_line = line
+
+        return best_line
+
+    def deduplicate_contexts(self, contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Удаляет точные дубликаты retrieved чанков."""
+        unique_contexts: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, int]] = set()
+
+        for context in contexts:
+            key = (context["source"], context["chunk_index"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_contexts.append(context)
+
+        return unique_contexts
+
+    def texts_are_too_similar(self, left_text: str, right_text: str) -> bool:
+        """Проверяет, что два чанка почти одинаковые по смыслу и словам."""
+        left_tokens = set(self.tokenize_query(left_text))
+        right_tokens = set(self.tokenize_query(right_text))
+        if not left_tokens or not right_tokens:
+            return False
+
+        overlap = len(left_tokens & right_tokens) / min(len(left_tokens), len(right_tokens))
+        return overlap >= 0.75
+
+    def keep_diverse_contexts(self, contexts: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        """Оставляет несколько разных по смыслу чанков без почти одинаковых дублей."""
+        selected: list[dict[str, Any]] = []
+
+        for context in contexts:
+            if any(self.texts_are_too_similar(context["text"], item["text"]) for item in selected):
+                continue
+            selected.append(context)
+            if len(selected) >= limit:
+                break
+
+        return selected
+
+    def doc_types_for_query(self, query_type: str) -> list[str] | None:
+        """Возвращает приоритетные типы документов для query_type."""
+        if query_type == "price":
+            return ["price"]
+        if query_type == "service":
+            return ["service", "faq"]
+        if query_type == "faq":
+            return ["faq", "service"]
+        return None
+
+    def get_hybrid_weights(self, query_type: str) -> tuple[float, float]:
+        """Возвращает веса keyword и embedding score для hybrid retrieval."""
+        if query_type == "price":
+            return PRICE_KEYWORD_WEIGHT, PRICE_EMBEDDING_WEIGHT
+        if query_type == "service":
+            return SERVICE_KEYWORD_WEIGHT, SERVICE_EMBEDDING_WEIGHT
+        if query_type == "faq":
+            return FAQ_KEYWORD_WEIGHT, FAQ_EMBEDDING_WEIGHT
+        return 0.5, 0.5
+
+    def apply_hybrid_score(self, contexts: list[dict[str, Any]], query_type: str) -> list[dict[str, Any]]:
+        """Добавляет hybrid_score к результатам retrieval."""
+        keyword_weight, embedding_weight = self.get_hybrid_weights(query_type)
+        scored: list[dict[str, Any]] = []
+        for item in contexts:
+            hybrid_score = item.get("keyword_score", 0.0) * keyword_weight + item.get("embedding_score", 0.0) * embedding_weight
+            scored.append({**item, "hybrid_score": round(hybrid_score, 4)})
+        return scored
+
+    def rerank_candidates(self, query: str, query_type: str, contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Легкий rule-based reranker без новых зависимостей."""
+        normalized_query = self.normalize_query(query)
+        query_tokens = set(self.tokenize_text(query))
+        reranked: list[dict[str, Any]] = []
+
+        for item in contexts:
+            text = item["text"]
+            normalized_text = self.normalize_query(text)
+            text_tokens = set(self.tokenize_text(text))
+            bonus = 0.0
+
+            if normalized_query and normalized_query in normalized_text:
+                bonus += 2.5
+            if query_tokens and query_tokens.issubset(text_tokens):
+                bonus += 1.5
+            if query_type == "service" and any(marker in text for marker in LIST_MARKERS):
+                bonus += 1.0
+            if query_type == "price" and len(normalized_text) > 220:
+                bonus -= 1.0
+            if query_type == "price" and " — от " in text:
+                bonus += 1.0
+
+            reranked.append(
+                {
+                    **item,
+                    "rerank_bonus": round(bonus, 4),
+                    "rerank_score": round(item.get("hybrid_score", 0.0) + bonus, 4),
+                }
+            )
+
+        reranked.sort(
+            key=lambda item: (-item.get("rerank_score", item.get("hybrid_score", 0.0)), item["source"], item["chunk_index"]),
+        )
+        for rank, item in enumerate(reranked, start=1):
+            item["rank"] = rank
+        return reranked
+
+    def merge_price_results(
+        self,
+        query: str,
+        embedding_results: list[dict[str, Any]],
+        keyword_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Объединяет embedding и keyword результаты для ценовых вопросов."""
+        merged: dict[tuple[str, int], dict[str, Any]] = {}
+
+        for item in embedding_results:
+            key = (item["source"], item["chunk_index"])
+            merged[key] = {**item}
+
+        for item in keyword_results:
+            key = (item["source"], item["chunk_index"])
+            existing = merged.get(key)
+            if existing:
+                existing["keyword_score"] = max(existing.get("keyword_score", 0), item["keyword_score"])
+            else:
+                merged[key] = {**item}
+
+        results = self.apply_hybrid_score(list(merged.values()), query_type="price")
+        results.sort(
+            key=lambda item: (-item.get("hybrid_score", 0), -item.get("keyword_score", 0), item["source"], item["chunk_index"]),
+        )
+
+        for rank, item in enumerate(results, start=1):
+            item["rank"] = rank
+            item["text"] = self.extract_best_price_line(query, item["text"])
+        return results
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_type: str,
+        top_k: int = 5,
+        doc_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Объединяет embedding search и keyword search в один hybrid retrieval."""
+        embedding_results = self.embedding_search(
+            question=query,
+            n_results=max(top_k, TOP_K),
+            doc_types=doc_types,
+        )
+        keyword_results = self.search_by_keywords(
+            query=query,
+            top_k=max(top_k, TOP_K),
+            doc_types=doc_types,
+            query_type=query_type,
+        )
+
+        merged: dict[tuple[str, int], dict[str, Any]] = {}
+        for item in embedding_results:
+            key = (item["source"], item["chunk_index"])
+            merged[key] = {**item}
+
+        for item in keyword_results:
+            key = (item["source"], item["chunk_index"])
+            existing = merged.get(key)
+            if existing:
+                existing["keyword_score"] = max(existing.get("keyword_score", 0.0), item.get("keyword_score", 0.0))
+            else:
+                merged[key] = {**item}
+
+        results = self.apply_hybrid_score(list(merged.values()), query_type=query_type)
+        results.sort(
+            key=lambda item: (-item.get("hybrid_score", 0), -item.get("keyword_score", 0), -item.get("embedding_score", 0), item["source"], item["chunk_index"]),
+        )
+
+        if ENABLE_RERANKER:
+            results = self.rerank_candidates(query=query, query_type=query_type, contexts=results[: max(top_k, 8)])
+
+        for rank, item in enumerate(results, start=1):
+            item["rank"] = rank
+        return results[:top_k]
+
     def build_retrieval_debug(self, contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Строит короткое представление retrieval для терминала."""
         debug_rows: list[dict[str, Any]] = []
@@ -311,33 +799,65 @@ class VectorStore:
                 {
                     "rank": rank,
                     "source": context.get("source", "источник не указан"),
+                    "doc_type": context.get("doc_type", "unknown"),
                     "chunk_index": context.get("chunk_index", -1),
+                    "keyword_score": context.get("keyword_score", 0),
+                    "embedding_score": context.get("embedding_score", 0.0),
+                    "hybrid_score": context.get("hybrid_score", 0.0),
+                    "rerank_score": context.get("rerank_score", 0.0),
                     "preview": preview,
                 }
             )
         return debug_rows
 
-    def search(self, question: str) -> list[dict[str, Any]]:
-        """Ищет TOP_K наиболее релевантных чанков и возвращает текст вместе с source."""
-        question_embedding = self.get_question_embedding(question)
-        results = self.collection.query(
-            query_embeddings=[question_embedding],
-            n_results=TOP_K,
-        )
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
+    def search(
+        self,
+        question: str,
+        query_type: str = "general",
+        original_question: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ищет чанки с учетом типа запроса: price, service, faq или general."""
+        source_question = original_question or question
+        doc_types = self.doc_types_for_query(query_type)
 
-        contexts: list[dict[str, Any]] = []
-        for rank, (document, metadata) in enumerate(zip(documents, metadatas), start=1):
-            contexts.append(
-                {
-                    "rank": rank,
-                    "text": document,
-                    "source": metadata.get("source", "unknown"),
-                    "chunk_index": metadata.get("chunk_index", -1),
-                }
+        if query_type == "price":
+            embedding_results = self.embedding_search(question=question, n_results=PRICE_RETRIEVAL_K, doc_types=doc_types)
+            keyword_results = self.search_price_by_keywords(source_question, k=PRICE_RETRIEVAL_K)
+            merged_results = self.merge_price_results(source_question, embedding_results, keyword_results)
+            if ENABLE_RERANKER:
+                merged_results = self.rerank_candidates(source_question, query_type="price", contexts=merged_results)
+            contexts = self.deduplicate_contexts(merged_results)
+            return contexts[:1]
+
+        if query_type == "service":
+            hybrid_results = self.hybrid_search(
+                query=source_question,
+                query_type="service",
+                top_k=SERVICE_RETRIEVAL_K,
+                doc_types=doc_types,
             )
-        return contexts[:TOP_K]
+            deduplicated = self.deduplicate_contexts(hybrid_results)
+            diverse = self.keep_diverse_contexts(deduplicated, limit=3)
+            return diverse[:3]
+
+        if query_type == "faq":
+            hybrid_results = self.hybrid_search(
+                query=source_question,
+                query_type="faq",
+                top_k=TOP_K + 2,
+                doc_types=doc_types,
+            )
+            deduplicated = self.deduplicate_contexts(hybrid_results)
+            diverse = self.keep_diverse_contexts(deduplicated, limit=3)
+            return diverse[:3]
+
+        hybrid_results = self.hybrid_search(
+            query=source_question,
+            query_type="general",
+            top_k=TOP_K,
+            doc_types=doc_types,
+        )
+        return self.deduplicate_contexts(hybrid_results)[:TOP_K]
 
     def get_cached_answer(self, question: str) -> Optional[dict[str, Any]]:
         """Возвращает закэшированный ответ и контексты, если они уже есть."""

@@ -17,7 +17,7 @@ from ragas.metrics import AnswerCorrectness, AnswerRelevancy, Faithfulness, Sema
 
 from config import CHUNK_MIN_SIZE, CHUNK_OVERLAP, CHUNK_SIZE, TOP_K
 from rag_pipeline import RAGPipeline
-from test_questions import TEST_DATASET
+from test_questions import RETRIEVAL_DEBUG_TESTS, TEST_DATASET, WARM_LEAD_TESTS
 
 
 EMBEDDING_MODEL = "text-embedding-3-small"
@@ -85,6 +85,13 @@ def parse_args() -> argparse.Namespace:
         description="Человекочитаемая оценка качества RAG-ассистента 'Мастер на час'.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Ограничить количество тестов. Пример: --limit 5")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["main", "warm-lead", "retrieval-debug"],
+        default="main",
+        help="Выбрать набор тестов: основной, warm lead или retrieval-debug.",
+    )
     parser.add_argument("--show-context", action="store_true", help="Показывать найденные чанки и источники по каждому тесту.")
     parser.add_argument("--verbose", action="store_true", help="Показывать расширенный вывод по каждому тесту.")
     parser.add_argument("--only-failed", action="store_true", help="Показывать только слабые тесты, где основная доступная метрика < 0.7.")
@@ -117,6 +124,7 @@ def print_header(reporter: Reporter) -> None:
     reporter.write("python rag_evaluation.py — полный запуск оценки по всем тестам")
     reporter.write("python rag_evaluation.py --limit 5 — короткий прогон на первых 5 тестах")
     reporter.write("python rag_evaluation.py --verbose — подробный вывод по каждому тесту")
+    reporter.write("python rag_evaluation.py --dataset warm-lead — прогон по warm lead сценариям")
     reporter.write("python rag_evaluation.py --show-context — показать найденные чанки и источники")
     reporter.write("python rag_evaluation.py --limit 5 --verbose --show-context — короткий, но подробный прогон с контекстом")
     reporter.write("python rag_evaluation.py --only-failed — показать только слабые тесты")
@@ -236,6 +244,8 @@ def print_test_result(
     reporter.write("")
     reporter.write("❓ Вопрос:")
     reporter.write(item["question"])
+    if item.get("type"):
+        reporter.write(f"Тип теста: {item['type']}")
     reporter.write("")
     reporter.write("🤖 Ответ RAG:")
     reporter.write(item["answer"])
@@ -273,9 +283,24 @@ def print_test_result(
     reporter.write("")
 
 
-def collect_test_records(pipeline: RAGPipeline, limit: int | None, reporter: Reporter) -> list[dict[str, Any]]:
+def get_selected_dataset(dataset_name: str) -> list[dict[str, Any]]:
+    """Возвращает выбранный набор тестов."""
+    if dataset_name == "warm-lead":
+        return WARM_LEAD_TESTS
+    if dataset_name == "retrieval-debug":
+        return RETRIEVAL_DEBUG_TESTS
+    return TEST_DATASET
+
+
+def collect_test_records(
+    pipeline: RAGPipeline,
+    dataset_name: str,
+    limit: int | None,
+    reporter: Reporter,
+) -> list[dict[str, Any]]:
     """Прогоняет тесты через RAG pipeline и собирает данные для RAGAS."""
-    selected_tests = TEST_DATASET[:limit] if limit else TEST_DATASET
+    dataset = get_selected_dataset(dataset_name)
+    selected_tests = dataset[:limit] if limit else dataset
     records: list[dict[str, Any]] = []
 
     print_step(reporter, "🧪 Шаг 3. Запускаю тесты...")
@@ -283,6 +308,7 @@ def collect_test_records(pipeline: RAGPipeline, limit: int | None, reporter: Rep
     reporter.write("")
 
     for index, item in enumerate(selected_tests, start=1):
+        pipeline.reset_history()
         reporter.write(f"   [{index}/{len(selected_tests)}] Обрабатываю вопрос: {item['question']}")
         result = pipeline.ask(item["question"])
         records.append(
@@ -291,6 +317,7 @@ def collect_test_records(pipeline: RAGPipeline, limit: int | None, reporter: Rep
                 "answer": result["answer"],
                 "contexts": result["contexts"],
                 "ground_truth": item["ground_truth"],
+                "type": item.get("type", "n/a"),
                 "user_input": item["question"],
                 "response": result["answer"],
                 "retrieved_contexts": [context["text"] for context in result["contexts"]],
@@ -434,7 +461,8 @@ def evaluate_rag(args: argparse.Namespace) -> None:
     print_header(reporter)
 
     print_step(reporter, "📂 Шаг 1. Проверяю папку data/...")
-    pipeline = RAGPipeline()
+    pipeline = RAGPipeline(dialog_id=f"evaluation_{args.dataset}")
+    pipeline.reset_history()
     documents = pipeline.vector_store.load_documents()
     reporter.write(f"📦 Найдено файлов базы знаний: {len(documents)}")
     reporter.write("")
@@ -458,6 +486,7 @@ def evaluate_rag(args: argparse.Namespace) -> None:
     reporter.write(f"- CHUNK_MIN_SIZE = {CHUNK_MIN_SIZE}")
     reporter.write(f"- CHUNK_OVERLAP = {CHUNK_OVERLAP}")
     reporter.write(f"- TOP_K = {TOP_K}")
+    reporter.write(f"- DATASET = {args.dataset}")
     reporter.write("")
 
     llm, embeddings = build_runtime_components()
@@ -471,7 +500,7 @@ def evaluate_rag(args: argparse.Namespace) -> None:
     reporter.write(f"🧪 Метрики запуска: {', '.join(metric.name for metric in metrics)}")
     reporter.write("")
 
-    records = collect_test_records(pipeline, args.limit, reporter)
+    records = collect_test_records(pipeline, args.dataset, args.limit, reporter)
     dataset = build_ragas_dataset(records)
 
     reporter.write("🧠 Шаг 4. Считаю метрики RAGAS...")

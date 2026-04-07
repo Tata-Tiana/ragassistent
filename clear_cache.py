@@ -28,6 +28,10 @@ def main() -> None:
     args = parse_args()
 
     print("Очистка кэша проекта...")
+    print("Что делает команда:")
+    print("- python clear_cache.py — удаляет файловый кэш")
+    print("- python clear_cache.py --all — удаляет файловый кэш и локальный индекс ChromaDB")
+    print("")
     removed_files = clear_cache_files()
 
     if removed_files:
